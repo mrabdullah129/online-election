@@ -55,7 +55,16 @@ import {
   maskSecretId,
   shouldAutoLock,
 } from "./lib/electionEngine.js";
-import { isSupabaseConfigured, requestPasswordReset, signInWithEmail, signUpWithProfile, supabase } from "./lib/supabase.js";
+import {
+  isSupabaseConfigured,
+  loadAppState,
+  requestPasswordReset,
+  saveAppState,
+  signInWithEmail,
+  signUpWithProfile,
+  supabase,
+  subscribeToAppState,
+} from "./lib/supabase.js";
 
 const STORAGE_KEY = "secure-election-demo-state";
 const SESSION_KEY = "secure-election-current-user";
@@ -219,13 +228,57 @@ function App() {
 
   const currentUser = data.users.find((user) => user.id === currentUserId) || null;
 
+  // Save app data to both localStorage and Supabase for cross-browser sync
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  }, [data]);
+
+    // Also sync to Supabase if configured and user is logged in
+    if (isSupabaseConfigured && currentUserId) {
+      saveAppState(currentUserId, data).catch((error) => {
+        console.warn("Failed to sync to Supabase:", error);
+      });
+    }
+  }, [data, currentUserId]);
 
   useEffect(() => {
     if (currentUserId) localStorage.setItem(SESSION_KEY, currentUserId);
     else localStorage.removeItem(SESSION_KEY);
+  }, [currentUserId]);
+
+  // Load app data from Supabase for cross-browser sync and subscribe to changes
+  useEffect(() => {
+    if (!isSupabaseConfigured || !currentUserId) return undefined;
+
+    let active = true;
+    let subscription;
+
+    async function loadAndSubscribe() {
+      // Load latest data from Supabase
+      const { data: supabaseData, error } = await loadAppState(currentUserId);
+
+      if (!active) return;
+
+      if (supabaseData && supabaseData.elections) {
+        // Update state with data from Supabase
+        setData(supabaseData);
+      }
+
+      // Subscribe to real-time changes from other tabs/browsers
+      subscription = subscribeToAppState(currentUserId, (updatedState) => {
+        if (active) {
+          setData(updatedState);
+        }
+      });
+    }
+
+    loadAndSubscribe();
+
+    return () => {
+      active = false;
+      if (subscription) {
+        subscription.unsubscribe();
+      }
+    };
   }, [currentUserId]);
 
   // Keep React session in sync with localStorage and other tabs/scripts
