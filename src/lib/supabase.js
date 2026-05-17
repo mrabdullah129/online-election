@@ -55,21 +55,26 @@ export async function saveAppState(userId, appData) {
   }
 
   try {
-    // Ensure app_state table exists, then save/update data
-    const { data, error } = await supabase.from("app_state").upsert(
-      {
-        user_id: userId,
-        state: appData,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "user_id" }
-    );
+    // Single-statement upsert avoids transient delete/insert gaps and duplicate writes.
+    const { data, error } = await supabase
+      .from("app_state")
+      .upsert(
+        {
+          user_id: userId,
+          state: appData,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id" },
+      )
+      .select("updated_at")
+      .single();
 
     if (error) {
       console.warn("Failed to save app state to Supabase:", error);
       return { error };
     }
 
+    console.log("✅ App state saved to Supabase for user:", userId);
     return { data };
   } catch (err) {
     console.warn("Error saving app state:", err);
@@ -86,21 +91,22 @@ export async function loadAppState(userId) {
   try {
     const { data, error } = await supabase
       .from("app_state")
-      .select("state")
+      .select("state, updated_at")
       .eq("user_id", userId)
-      .single();
-
-    if (error?.code === "PGRST116") {
-      // No data found - this is expected on first load
-      return { data: null, error: null };
-    }
+      .maybeSingle();
 
     if (error) {
       console.warn("Failed to load app state from Supabase:", error);
       return { data: null, error };
     }
 
-    return { data: data?.state || null, error: null };
+    if (data?.state) {
+      console.log("✅ App state loaded from Supabase for user:", userId);
+      return { data: data.state, updatedAt: data.updated_at || null, error: null };
+    }
+
+    console.log("No app state found in Supabase for user:", userId);
+    return { data: null, error: null };
   } catch (err) {
     console.warn("Error loading app state:", err);
     return { data: null, error: err };
@@ -125,7 +131,7 @@ export function subscribeToAppState(userId, onStateChange) {
       },
       (payload) => {
         if (payload.new?.state) {
-          onStateChange(payload.new.state);
+          onStateChange(payload.new.state, payload.new.updated_at || payload.commit_timestamp || null);
         }
       }
     )

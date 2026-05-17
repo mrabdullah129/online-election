@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   BarChart3,
@@ -210,6 +210,78 @@ function mapProfile(user, profile) {
   };
 }
 
+function mergeByIdentity(localItems = [], remoteItems = [], getIdentity = (item) => item?.id) {
+  const merged = new Map();
+
+  localItems.forEach((item) => {
+    const key = getIdentity(item);
+    if (key) merged.set(String(key), item);
+  });
+
+  remoteItems.forEach((item) => {
+    const key = getIdentity(item);
+    if (!key) return;
+    const id = String(key);
+    const localItem = merged.get(id);
+    merged.set(id, localItem ? { ...item, ...localItem } : item);
+  });
+
+  return Array.from(merged.values());
+}
+
+function mergeElectionState(localElection, remoteElection) {
+  return {
+    ...remoteElection,
+    ...localElection,
+    candidates: mergeByIdentity(
+      localElection?.candidates || [],
+      remoteElection?.candidates || [],
+      (candidate) => candidate?.id,
+    ),
+    registrations: mergeByIdentity(
+      localElection?.registrations || [],
+      remoteElection?.registrations || [],
+      (registration) => registration?.id || registration?.voterId || registration?.email,
+    ),
+    waitlist: mergeByIdentity(
+      localElection?.waitlist || [],
+      remoteElection?.waitlist || [],
+      (registration) => registration?.id || registration?.voterId || registration?.email,
+    ),
+    votes: {
+      ...(remoteElection?.votes || {}),
+      ...(localElection?.votes || {}),
+    },
+  };
+}
+
+function mergeAppState(localState, remoteState) {
+  if (!remoteState || typeof remoteState !== "object") return localState;
+
+  const mergedElections = mergeByIdentity(localState?.elections || [], remoteState?.elections || [], (election) => election?.id).map(
+    (election) => {
+      const localElection = (localState?.elections || []).find((item) => item?.id === election?.id);
+      const remoteElection = (remoteState?.elections || []).find((item) => item?.id === election?.id);
+      if (!localElection || !remoteElection) return election;
+      return mergeElectionState(localElection, remoteElection);
+    },
+  );
+
+  return {
+    ...remoteState,
+    ...localState,
+    users: mergeByIdentity(localState?.users || [], remoteState?.users || [], (user) => user?.id),
+    creatorRequests: mergeByIdentity(
+      localState?.creatorRequests || [],
+      remoteState?.creatorRequests || [],
+      (request) => request?.id || `${request?.email || ""}:${request?.createdAt || ""}`,
+    ),
+    elections: mergedElections,
+    notifications: mergeByIdentity(localState?.notifications || [], remoteState?.notifications || [], (notice) => notice?.id),
+    auditLogs: mergeByIdentity(localState?.auditLogs || [], remoteState?.auditLogs || [], (log) => log?.id || log?.createdAt),
+  };
+}
+
 function App() {
   const [data, setData] = useState(loadInitialData);
   const [currentUserId, setCurrentUserId] = useState(() => {
@@ -225,18 +297,61 @@ function App() {
   const [darkMode, setDarkMode] = useState(false);
   const [now, setNow] = useState(new Date());
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const latestDataRef = useRef(data);
+  const saveTimerRef = useRef(null);
+  const saveInFlightRef = useRef(false);
+  const pendingSaveRef = useRef(false);
+  const applyingRemoteStateRef = useRef(false);
 
   const currentUser = data.users.find((user) => user.id === currentUserId) || null;
 
   // Save app data to both localStorage and Supabase for cross-browser sync
   useEffect(() => {
+    latestDataRef.current = data;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
 
     // Also sync to Supabase if configured and user is logged in
     if (isSupabaseConfigured && currentUserId) {
-      saveAppState(currentUserId, data).catch((error) => {
-        console.warn("Failed to sync to Supabase:", error);
-      });
+      if (applyingRemoteStateRef.current) {
+        applyingRemoteStateRef.current = false;
+        return;
+      }
+
+      pendingSaveRef.current = true;
+
+      if (saveTimerRef.current) {
+        window.clearTimeout(saveTimerRef.current);
+      }
+
+      async function flushLatestSave() {
+        if (saveInFlightRef.current) return;
+        if (!pendingSaveRef.current) return;
+
+        pendingSaveRef.current = false;
+        saveInFlightRef.current = true;
+        try {
+          await saveAppState(currentUserId, latestDataRef.current);
+        } catch (error) {
+          console.warn("Failed to sync to Supabase:", error);
+        } finally {
+          saveInFlightRef.current = false;
+        }
+
+        if (pendingSaveRef.current) {
+          void flushLatestSave();
+        }
+      }
+
+      saveTimerRef.current = window.setTimeout(() => {
+        void flushLatestSave();
+      }, 250);
+
+      return () => {
+        if (saveTimerRef.current) {
+          window.clearTimeout(saveTimerRef.current);
+          saveTimerRef.current = null;
+        }
+      };
     }
   }, [data, currentUserId]);
 
@@ -252,21 +367,27 @@ function App() {
     let active = true;
     let subscription;
 
+    function applyRemoteState(nextState) {
+      if (!nextState || !nextState.elections) return;
+      applyingRemoteStateRef.current = true;
+      setData((previous) => mergeAppState(previous, nextState));
+    }
+
     async function loadAndSubscribe() {
       // Load latest data from Supabase
-      const { data: supabaseData, error } = await loadAppState(currentUserId);
+      const { data: supabaseData } = await loadAppState(currentUserId);
 
       if (!active) return;
 
       if (supabaseData && supabaseData.elections) {
-        // Update state with data from Supabase
-        setData(supabaseData);
+        // Merge remote snapshot with local state to avoid dropping recent unsynced edits.
+        applyRemoteState(supabaseData);
       }
 
       // Subscribe to real-time changes from other tabs/browsers
       subscription = subscribeToAppState(currentUserId, (updatedState) => {
         if (active) {
-          setData(updatedState);
+          applyRemoteState(updatedState);
         }
       });
     }
