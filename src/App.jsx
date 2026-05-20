@@ -66,6 +66,7 @@ import {
   subscribeToAppState,
 } from "./lib/supabase.js";
 
+// Application-level constants (required for local state/session keys and UI colors)
 const STORAGE_KEY = "secure-election-demo-state";
 const SESSION_KEY = "secure-election-current-user";
 const CHART_COLORS = ["#2563eb", "#0f766e", "#f97316", "#7c3aed", "#dc2626"];
@@ -76,111 +77,6 @@ const roleLabels = {
   voter: "Voter",
 };
 
-const SECRET_ID_PATTERN = /\b([A-Z0-9][A-Z0-9_-]*-\d{4}-[A-Z0-9]{4})\b/i;
-const SECRET_SUBJECT_PREFIX = "Your secure voter ID for ";
-
-function normalizeSecretId(secretId) {
-  return String(secretId || "").trim().toUpperCase();
-}
-
-function fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
-function extractIssuedSecretId(...values) {
-  for (const value of values) {
-    const match = String(value || "").match(SECRET_ID_PATTERN);
-    if (match?.[1]) return normalizeSecretId(match[1]);
-  }
-  return "";
-}
-
-function getSecretNotificationTitle(notification) {
-  const subject = String(notification?.subject || "").trim();
-  if (subject.toLowerCase().startsWith(SECRET_SUBJECT_PREFIX.toLowerCase())) {
-    return subject.slice(SECRET_SUBJECT_PREFIX.length).trim();
-  }
-  return "";
-}
-
-function secretLookupKey(title, email) {
-  return `${String(title || "").trim().toLowerCase()}::${String(email || "").trim().toLowerCase()}`;
-}
-
-function formatStoredSecretId(prefix, ordinal, suffix) {
-  if (!ordinal || !suffix) return "";
-  return `${String(prefix || "POLL").trim().toUpperCase()}-${String(ordinal).padStart(4, "0")}-${String(suffix).trim().toUpperCase()}`;
-}
-
-function parseSecretId(secretId) {
-  const normalized = normalizeSecretId(secretId);
-  const match = normalized.match(/^([A-Z0-9][A-Z0-9_-]*)-(\d{4})-([A-Z0-9]{4})$/);
-  if (!match) return null;
-
-  return {
-    prefix: match[1],
-    ordinal: Number(match[2]),
-    suffix: match[3],
-  };
-}
-
-function buildSecretVoteCandidates(election, registration, secretId) {
-  const normalized = normalizeSecretId(secretId);
-  const parsed = parseSecretId(normalized);
-  const prefix = parsed?.prefix || String(election?.codePrefix || "").trim().toUpperCase();
-  const suffix = String(registration?.secret_code_suffix || parsed?.suffix || "").trim().toUpperCase();
-  const maxOrdinal = Math.min(
-    Math.max(
-      Number(election?.maxVoters) || 0,
-      Number(election?.finalizedVoterCount) || 0,
-      election?.registrations?.length || 0,
-      parsed?.ordinal || 0,
-      1,
-    ),
-    500,
-  );
-  const candidates = [normalized];
-
-  if (prefix && suffix) {
-    for (let ordinal = 1; ordinal <= maxOrdinal; ordinal += 1) {
-      candidates.push(formatStoredSecretId(prefix, ordinal, suffix));
-    }
-  }
-
-  return [...new Set(candidates.filter(Boolean))];
-}
-
-function isMissingColumnError(error, columnName) {
-  const message = `${error?.message || ""} ${error?.details || ""} ${error?.hint || ""}`;
-  return message.toLowerCase().includes(columnName.toLowerCase());
-}
-
-function isSecretVoteError(message) {
-  const normalized = String(message || "").toLowerCase();
-  return normalized.includes("invalid secret id") || normalized.includes("vote already used");
-}
-
-const defaultElectionForm = {
-  title: "",
-  description: "",
-  category: "University",
-  startAt: "",
-  endAt: "",
-  registrationDeadline: "",
-  maxVoters: 100,
-};
-
-const defaultCandidateForm = {
-  name: "",
-  designation: "",
-  manifesto: "",
-  photo: "",
-};
 
 function loadInitialData() {
   try {
@@ -1435,7 +1331,13 @@ function App() {
                 ...item,
                 registrations: item.registrations.map((record) =>
                   isSameRegistration(record)
-                    ? { ...record, secretId: acceptedSecret || record.secretId, voted: true, votedAt: new Date().toISOString() }
+                    ? {
+                        ...record,
+                        secretId: acceptedSecret || record.secretId,
+                        voted: true,
+                        votedAt: new Date().toISOString(),
+                        votedFor: candidateId,
+                      }
                     : record,
                 ),
                 votes: { ...item.votes, [candidateId]: (item.votes[candidateId] || 0) + 1 },
@@ -1450,6 +1352,7 @@ function App() {
       setNotice(message);
       return true;
     }
+
 
     // If Supabase is configured, attempt to persist the vote to the backend.
     if (isSupabaseConfigured && supabase) {
@@ -1506,7 +1409,7 @@ function App() {
                     ...item,
                     registrations: item.registrations.map((record) =>
                       isSameRegistration(record)
-                        ? { ...record, secretId: secretCandidate, voted: true, votedAt: new Date().toISOString() }
+                        ? { ...record, secretId: secretCandidate, voted: true, votedAt: new Date().toISOString(), votedFor: candidateId }
                         : record,
                     ),
                     votes: { ...item.votes, [candidateId]: (item.votes[candidateId] || 0) + 1 },
@@ -1557,17 +1460,117 @@ function App() {
     const election = data.elections.find((item) => item.id === electionId);
     if (!election) return;
     const pdf = new jsPDF();
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const margin = 14;
+    const contentWidth = pageWidth - margin * 2;
+
     const winner = getWinner(election);
+
+    // Page 1: Summary & Results
     pdf.setFontSize(18);
-    pdf.text("Election Result Report", 14, 20);
+    pdf.text("Election Result Report", pageWidth / 2, 20, { align: "center" });
+
     pdf.setFontSize(12);
-    pdf.text(election.title, 14, 32);
-    pdf.text(`Category: ${election.category}`, 14, 40);
-    pdf.text(`Turnout: ${getTurnout(election)}%`, 14, 48);
-    pdf.text(`Winner: ${winner?.name || "No winner yet"}`, 14, 56);
-    getResults(election).forEach((candidate, index) => {
-      pdf.text(`${index + 1}. ${candidate.name} - ${candidate.votes} votes (${candidate.percent}%)`, 14, 70 + index * 8);
+    let y = 36;
+
+    // Info table (simple two-column layout)
+    const infoLeft = margin;
+    const infoRight = margin + contentWidth * 0.5;
+    const rowH = 8;
+
+    pdf.setFontSize(11);
+    pdf.text("Election / Organization", infoLeft, y);
+    pdf.text(String(election.title || ""), infoRight, y);
+    y += rowH;
+    pdf.text("Category", infoLeft, y);
+    pdf.text(String(election.category || ""), infoRight, y);
+    y += rowH;
+    pdf.text("Turnout", infoLeft, y);
+    pdf.text(`${getTurnout(election)}%`, infoRight, y);
+    y += rowH;
+    pdf.text("Winner", infoLeft, y);
+    pdf.text(winner?.name || "No winner yet", infoRight, y);
+    y += rowH + 6;
+
+    // Results table header
+    pdf.setFontSize(14);
+    pdf.text("Results", margin, y);
+    y += 8;
+    pdf.setFontSize(11);
+
+    const results = getResults(election);
+    // Simple results rows
+    results.forEach((candidate, idx) => {
+      pdf.text(`${idx + 1}. ${candidate.name}`, margin, y);
+      pdf.text(String(candidate.votes || 0), margin + contentWidth * 0.6, y);
+      pdf.text(`${candidate.percent}%`, margin + contentWidth * 0.8, y);
+      y += rowH;
     });
+
+    pdf.addPage();
+
+    // Page 2: Candidate-wise Voter ID Record
+    pdf.setFontSize(18);
+    pdf.text("Candidate-wise Voter ID Record", pageWidth / 2, 20, { align: "center" });
+    pdf.setFontSize(11);
+    pdf.text(
+      "Each column is one candidate. Below each candidate, only the Secret ID(s) of voters who voted for that candidate are shown.",
+      margin,
+      30,
+      { maxWidth: contentWidth },
+    );
+
+    // Build candidate -> masked secret id lists using registration.votedFor when present.
+    const candidateList = election.candidates || [];
+    const candidateIds = candidateList.map((c) => c.id);
+    const perCandidate = candidateList.map((c) => {
+      const ids = (election.registrations || [])
+        .filter((r) => r.voted && r.votedFor === c.id)
+        .map((r) => maskSecretId(r.secretId || ""));
+      return ids;
+    });
+
+    // If some registrations have voted but lack `votedFor`, attempt a conservative inference for display only:
+    const votesMap = election.votes || {};
+    let unassigned = (election.registrations || []).filter((r) => r.voted && !r.votedFor).sort((a, b) => new Date(a.votedAt || a.joinedAt) - new Date(b.votedAt || b.joinedAt));
+
+    // Distribute unassigned voted registrations to candidates based on remaining vote counts
+    for (let i = 0; i < candidateList.length && unassigned.length > 0; i++) {
+      const cid = candidateList[i].id;
+      const target = Math.max(0, (votesMap[cid] || 0) - perCandidate[i].length);
+      for (let k = 0; k < target && unassigned.length > 0; k++) {
+        const r = unassigned.shift();
+        perCandidate[i].push(maskSecretId(r.secretId || ""));
+      }
+    }
+
+    const maxRows = Math.max(1, ...perCandidate.map((list) => list.length));
+    const colWidth = contentWidth / Math.max(1, candidateList.length);
+    const headerY = 48;
+    const startY = headerY + 10;
+
+    // Header row with candidate names
+    pdf.setFontSize(12);
+    candidateList.forEach((c, idx) => {
+      const x = margin + idx * colWidth + 4;
+      pdf.text(c.name || "Candidate", x, headerY);
+    });
+
+    // Rows of masked IDs (one per line)
+    pdf.setFontSize(11);
+    for (let row = 0; row < maxRows; row++) {
+      const rowY = startY + row * 10;
+      candidateList.forEach((_c, colIdx) => {
+        const ids = perCandidate[colIdx] || [];
+        const value = ids[row] || "";
+        const x = margin + colIdx * colWidth + 4;
+        pdf.text(value, x, rowY);
+      });
+    }
+
+    pdf.setFontSize(10);
+    pdf.text("Note: Blank cells mean no voter ID was recorded for that candidate.", margin, startY + maxRows * 10 + 10);
+
     pdf.save(`${election.title.replace(/[^a-z0-9]/gi, "-").toLowerCase()}-results.pdf`);
     setNotice("Result PDF generated.");
   }
